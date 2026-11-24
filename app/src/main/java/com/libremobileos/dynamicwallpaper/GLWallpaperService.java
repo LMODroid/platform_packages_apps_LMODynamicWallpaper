@@ -15,6 +15,7 @@
  */
 package com.libremobileos.dynamicwallpaper;
 
+import android.app.WallpaperColors;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -89,6 +90,9 @@ public class GLWallpaperService extends WallpaperService {
         };
         private boolean visible;
         private long fadeStart;
+        /** The colors of slot colorsSlot, for Styles' wallpaper colors and SystemUI's text contrast. */
+        private WallpaperColors colors;
+        private int colorsSlot = -1;
 
         private int slot = -1;
         private int width, height;
@@ -149,6 +153,7 @@ public class GLWallpaperService extends WallpaperService {
             int s = currentSlot();
             if (s != slot && width > 0) {
                 slot = s;
+                notifyColorsChanged();   // SystemUI applies a theme change only once the screen is off
                 Bitmap next = load(s);
                 if (visible && shown != null) {
                     previous = shown;
@@ -186,6 +191,20 @@ public class GLWallpaperService extends WallpaperService {
             previous = null;
             alpha = 1f;
             draw();
+        }
+
+        @Override
+        public WallpaperColors onComputeColors() {
+            int s = slot >= 0 ? slot : currentSlot();
+            if (s != colorsSlot) {
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inSampleSize = 16;   // ~160 px: plenty for the color extraction
+                Bitmap small = BitmapFactory.decodeResource(getResources(), SLOT_IMAGE[s], o);
+                colors = WallpaperColors.fromBitmap(small);
+                small.recycle();
+                colorsSlot = s;
+            }
+            return colors;
         }
 
         /** The slot's image decoded no larger than needed and cropped to the surface size. */
