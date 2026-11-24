@@ -15,6 +15,10 @@
  */
 package com.libremobileos.dynamicwallpaper;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -22,6 +26,7 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.service.wallpaper.WallpaperService;
 import android.view.SurfaceHolder;
 
@@ -50,6 +55,21 @@ public class GLWallpaperService extends WallpaperService {
         return slotAt(Calendar.getInstance().get(Calendar.HOUR_OF_DAY));
     }
 
+    /** Milliseconds from now until the next image starts. */
+    static long millisToNextSlot(Calendar now) {
+        int hour = now.get(Calendar.HOUR_OF_DAY);
+        int next = SLOT_START[(slotAt(hour) + 1) % SLOT_START.length];
+        Calendar at = (Calendar) now.clone();
+        at.set(Calendar.HOUR_OF_DAY, next);
+        at.set(Calendar.MINUTE, 0);
+        at.set(Calendar.SECOND, 0);
+        at.set(Calendar.MILLISECOND, 0);
+        if (!at.after(now)) at.add(Calendar.DAY_OF_MONTH, 1);
+        return at.getTimeInMillis() - now.getTimeInMillis();
+    }
+
+    private static final long FADE_MS = 1200;
+
     @Override
     public Engine onCreateEngine() {
         return new DynamicEngine();
@@ -59,6 +79,16 @@ public class GLWallpaperService extends WallpaperService {
         private final Handler handler = new Handler(Looper.getMainLooper());
         private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
         private final Runnable slotCheck = this::updateSlot;
+        private final Runnable fadeFrame = this::fadeFrame;
+        /** The time or the time zone changed: the image may be another one now. */
+        private final BroadcastReceiver timeChanged = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                updateSlot();
+            }
+        };
+        private boolean visible;
+        private long fadeStart;
 
         private int slot = -1;
         private int width, height;
@@ -67,6 +97,25 @@ public class GLWallpaperService extends WallpaperService {
         /** The image faded out, only while a fade runs. */
         private Bitmap previous;
         private float alpha = 1f;
+
+        @Override
+        public void onCreate(SurfaceHolder holder) {
+            super.onCreate(holder);
+            IntentFilter filter = new IntentFilter(Intent.ACTION_TIME_CHANGED);
+            filter.addAction(Intent.ACTION_TIMEZONE_CHANGED);
+            filter.addAction(Intent.ACTION_DATE_CHANGED);
+            registerReceiver(timeChanged, filter, Context.RECEIVER_NOT_EXPORTED);
+        }
+
+        @Override
+        public void onVisibilityChanged(boolean v) {
+            visible = v;
+            if (v) {
+                updateSlot();   // the phone may have slept through the change (the handler's clock stops)
+            } else if (previous != null) {
+                endFade();
+            }
+        }
 
         @Override
         public void onSurfaceChanged(SurfaceHolder holder, int format, int w, int h) {
@@ -79,8 +128,7 @@ public class GLWallpaperService extends WallpaperService {
             previous = null;
             alpha = 1f;
             draw();
-            handler.removeCallbacks(slotCheck);
-            handler.postDelayed(slotCheck, 60000);
+            scheduleNext();
         }
 
         @Override
@@ -92,6 +140,7 @@ public class GLWallpaperService extends WallpaperService {
         @Override
         public void onDestroy() {
             super.onDestroy();
+            unregisterReceiver(timeChanged);
             handler.removeCallbacksAndMessages(null);
             shown = previous = null;
         }
@@ -100,27 +149,43 @@ public class GLWallpaperService extends WallpaperService {
             int s = currentSlot();
             if (s != slot && width > 0) {
                 slot = s;
-                previous = shown;
-                shown = load(s);
-                startFade();
-            }
-            handler.postDelayed(slotCheck, 60000);
-        }
-
-        private void startFade() {
-            alpha = 0f;
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    alpha = Math.min(1f, alpha + 0.2f);
-                    if (alpha < 1f) {
-                        handler.postDelayed(this, 1000 / 60);
-                    } else {
-                        previous = null;
-                    }
+                Bitmap next = load(s);
+                if (visible && shown != null) {
+                    previous = shown;
+                    shown = next;
+                    fadeStart = SystemClock.uptimeMillis();
+                    handler.removeCallbacks(fadeFrame);
+                    handler.post(fadeFrame);
+                } else {
+                    shown = next;   // nobody sees it change: no fade
+                    previous = null;
                     draw();
                 }
-            });
+            }
+            scheduleNext();
+        }
+
+        private void scheduleNext() {
+            handler.removeCallbacks(slotCheck);
+            handler.postDelayed(slotCheck, millisToNextSlot(Calendar.getInstance()) + 1000);
+        }
+
+        private void fadeFrame() {
+            float t = Math.min(1f, (SystemClock.uptimeMillis() - fadeStart) / (float) FADE_MS);
+            alpha = t * t * (3 - 2 * t);   // ease in and out
+            if (t < 1f) {
+                draw();
+                handler.postDelayed(fadeFrame, 16);
+            } else {
+                endFade();
+            }
+        }
+
+        private void endFade() {
+            handler.removeCallbacks(fadeFrame);
+            previous = null;
+            alpha = 1f;
+            draw();
         }
 
         /** The slot's image decoded no larger than needed and cropped to the surface size. */
