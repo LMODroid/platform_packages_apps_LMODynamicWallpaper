@@ -25,161 +25,144 @@ import android.os.Looper;
 import android.service.wallpaper.WallpaperService;
 import android.view.SurfaceHolder;
 
-import com.libremobileos.dynamicwallpaper.R;
-
 import java.util.Calendar;
 
+/**
+ * Shows one of four images by the time of day. The name stays: the default wallpaper
+ * (config_default_wallpaper_component) and the wallpaper users picked point to this class.
+ */
 public class GLWallpaperService extends WallpaperService {
+
+    /** The hour each image starts at, in order: morning, noon, evening, night (until morning). */
+    static final int[] SLOT_START = {6, 11, 16, 20};
+    static final int[] SLOT_IMAGE = {
+            R.drawable.morning, R.drawable.noon, R.drawable.evening, R.drawable.night};
+
+    /** The image for this hour of the day (0-23). */
+    static int slotAt(int hour) {
+        for (int i = SLOT_START.length - 1; i >= 0; i--) {
+            if (hour >= SLOT_START[i]) return i;
+        }
+        return SLOT_START.length - 1;   // after midnight: still the night
+    }
+
+    static int currentSlot() {
+        return slotAt(Calendar.getInstance().get(Calendar.HOUR_OF_DAY));
+    }
 
     @Override
     public Engine onCreateEngine() {
-        return new GLEngine();
+        return new DynamicEngine();
     }
 
-    private class GLEngine extends Engine {
+    private class DynamicEngine extends Engine {
         private final Handler handler = new Handler(Looper.getMainLooper());
-        private Bitmap currentWallpaper, nextWallpaper;
-        private float alpha = 0f;
-        private final Paint paint = new Paint();
+        private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        private final Runnable slotCheck = this::updateSlot;
 
-        private static final int MORNING_START = 6;
-        private static final int NOON_START = 11;
-        private static final int EVENING_START = 16;
-        private static final int NIGHT_START = 20;
-
-        private int lastWidth = -1;
-        private int lastHeight = -1;
-
-        @Override
-        public void onSurfaceCreated(SurfaceHolder holder) {
-            super.onSurfaceCreated(holder);
-            setWallpaperBasedOnTime();
-            startWallpaperUpdate();
-        }
+        private int slot = -1;
+        private int width, height;
+        /** The image of the current slot, cropped to the surface: the only full-size bitmap kept. */
+        private Bitmap shown;
+        /** The image faded out, only while a fade runs. */
+        private Bitmap previous;
+        private float alpha = 1f;
 
         @Override
-        public void onSurfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-            super.onSurfaceChanged(holder, format, width, height);
-
-            if (width != lastWidth || height != lastHeight) {
-                lastWidth = width;
-                lastHeight = height;
-                drawWallpaper();
-            }
+        public void onSurfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+            super.onSurfaceChanged(holder, format, w, h);
+            if (w == width && h == height && shown != null) return;
+            width = w;
+            height = h;
+            slot = currentSlot();
+            shown = load(slot);
+            previous = null;
+            alpha = 1f;
+            draw();
+            handler.removeCallbacks(slotCheck);
+            handler.postDelayed(slotCheck, 60000);
         }
 
         @Override
-        public void onSurfaceDestroyed(SurfaceHolder holder) {
-            super.onSurfaceDestroyed(holder);
-            lastWidth = -1;
-            lastHeight = -1;
+        public void onSurfaceRedrawNeeded(SurfaceHolder holder) {
+            super.onSurfaceRedrawNeeded(holder);
+            draw();
         }
 
-        private void setWallpaperBasedOnTime() {
-            Calendar calendar = Calendar.getInstance();
-            int hourOfDay = calendar.get(Calendar.HOUR_OF_DAY);
+        @Override
+        public void onDestroy() {
+            super.onDestroy();
+            handler.removeCallbacksAndMessages(null);
+            shown = previous = null;
+        }
 
-            int nextWallpaperRes;
-            if (hourOfDay >= MORNING_START && hourOfDay < NOON_START) {
-                nextWallpaperRes = R.drawable.morning;
-            } else if (hourOfDay >= NOON_START && hourOfDay < EVENING_START) {
-                nextWallpaperRes = R.drawable.noon;
-            } else if (hourOfDay >= EVENING_START && hourOfDay < NIGHT_START) {
-                nextWallpaperRes = R.drawable.evening;
-            } else {
-                nextWallpaperRes = R.drawable.night;
+        private void updateSlot() {
+            int s = currentSlot();
+            if (s != slot && width > 0) {
+                slot = s;
+                previous = shown;
+                shown = load(s);
+                startFade();
             }
-
-            if (nextWallpaper == null || nextWallpaperRes != getCurrentWallpaperResId()) {
-                nextWallpaper = BitmapFactory.decodeResource(getResources(), nextWallpaperRes);
-                startCrossFadeAnimation();
-            }
+            handler.postDelayed(slotCheck, 60000);
         }
 
-        private int getCurrentWallpaperResId() {
-            if (currentWallpaper == null) return -1;
-            if (currentWallpaper.sameAs(BitmapFactory.decodeResource(getResources(), R.drawable.morning)))
-                return R.drawable.morning;
-            if (currentWallpaper.sameAs(BitmapFactory.decodeResource(getResources(), R.drawable.noon)))
-                return R.drawable.noon;
-            if (currentWallpaper.sameAs(BitmapFactory.decodeResource(getResources(), R.drawable.evening)))
-                return R.drawable.evening;
-            return R.drawable.night;
-        }
-
-        private void startCrossFadeAnimation() {
+        private void startFade() {
             alpha = 0f;
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    alpha += 0.2f;
-                    if (alpha >= 1f) {
-                        alpha = 1f;
-                        currentWallpaper = nextWallpaper;
-                    } else {
+                    alpha = Math.min(1f, alpha + 0.2f);
+                    if (alpha < 1f) {
                         handler.postDelayed(this, 1000 / 60);
+                    } else {
+                        previous = null;
                     }
-                    drawWallpaper();
+                    draw();
                 }
             });
         }
 
-        private void drawWallpaper() {
-            SurfaceHolder holder = getSurfaceHolder();
-            Canvas canvas = holder.lockCanvas();
-            if (canvas != null) {
-                int width = canvas.getWidth();
-                int height = canvas.getHeight();
-
-                Bitmap scaledCurrent = (currentWallpaper != null) ? scaleCenterCrop(currentWallpaper, width, height) : null;
-                Bitmap scaledNext = (nextWallpaper != null) ? scaleCenterCrop(nextWallpaper, width, height) : null;
-
-                if (scaledCurrent != null) {
-                    canvas.drawBitmap(scaledCurrent, 0, 0, null);
-                }
-                if (scaledNext != null) {
-                    paint.setAlpha((int) (alpha * 255));
-                    canvas.drawBitmap(scaledNext, 0, 0, paint);
-                }
-
-                holder.unlockCanvasAndPost(canvas);
-            }
+        /** The slot's image decoded no larger than needed and cropped to the surface size. */
+        private Bitmap load(int s) {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeResource(getResources(), SLOT_IMAGE[s], o);
+            float scale = Math.max((float) width / o.outWidth, (float) height / o.outHeight);
+            int sample = 1;
+            while (sample * 2 * scale <= 1f) sample *= 2;   // still at least as big as the crop
+            o = new BitmapFactory.Options();
+            o.inSampleSize = sample;
+            Bitmap src = BitmapFactory.decodeResource(getResources(), SLOT_IMAGE[s], o);
+            Bitmap out = centerCrop(src, width, height);
+            if (out != src) src.recycle();
+            return out;
         }
 
-        private Bitmap scaleCenterCrop(Bitmap source, int newWidth, int newHeight) {
-            if (source == null || source.isRecycled()) return null;
-
-            float scale = Math.max(
-                    (float) newWidth / source.getWidth(),
-                    (float) newHeight / source.getHeight()
-            );
-
-            float scaledWidth = scale * source.getWidth();
-            float scaledHeight = scale * source.getHeight();
-
-            float dx = (newWidth - scaledWidth) / 2;
-            float dy = (newHeight - scaledHeight) / 2;
-
+        private Bitmap centerCrop(Bitmap source, int w, int h) {
+            float scale = Math.max((float) w / source.getWidth(), (float) h / source.getHeight());
             Matrix matrix = new Matrix();
             matrix.setScale(scale, scale);
-            matrix.postTranslate(dx, dy);
-
-            Bitmap outputBitmap = Bitmap.createBitmap(newWidth, newHeight, Bitmap.Config.ARGB_8888);
-            Canvas canvas = new Canvas(outputBitmap);
-            Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
-            canvas.drawBitmap(source, matrix, paint);
-
-            return outputBitmap;
+            matrix.postTranslate((w - scale * source.getWidth()) / 2f, (h - scale * source.getHeight()) / 2f);
+            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            new Canvas(out).drawBitmap(source, matrix, new Paint(Paint.FILTER_BITMAP_FLAG));
+            return out;
         }
 
-        private void startWallpaperUpdate() {
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    setWallpaperBasedOnTime();
-                    startWallpaperUpdate();
+        private void draw() {
+            SurfaceHolder holder = getSurfaceHolder();
+            if (shown == null || holder.getSurface() == null || !holder.getSurface().isValid()) return;
+            Canvas canvas = holder.lockHardwareCanvas();
+            if (canvas == null) return;
+            try {
+                if (previous != null) {
+                    canvas.drawBitmap(previous, 0, 0, null);
                 }
-            }, 60000);
+                paint.setAlpha(previous != null ? (int) (alpha * 255) : 255);
+                canvas.drawBitmap(shown, 0, 0, paint);
+            } finally {
+                holder.unlockCanvasAndPost(canvas);
+            }
         }
     }
 }
